@@ -526,6 +526,7 @@
 <div class="toast" id="toast"></div>
 
 <script>
+
 // ===== Config =====
 const INDICES = [
   { name: '标普500 SPX',  sina: 'gb_$inx'   },
@@ -533,7 +534,6 @@ const INDICES = [
   { name: '道琼斯 DJIA',  sina: 'gb_$dji'   },
   { name: '纳指100 NDX',  sina: 'gb_$ndx'   },
 ];
-
 const STOCKS = [
   { ticker: 'AAPL',  sina: 'gb_aapl',  name: '苹果' },
   { ticker: 'MSFT',  sina: 'gb_msft',  name: '微软' },
@@ -553,61 +553,19 @@ const STOCKS = [
 const state = {
   funds: JSON.parse(localStorage.getItem('tracked_funds') || '[]'),
   fundData: {},
-  lastUpdate: null,
+  marketData: null,
   refreshTimer: null,
   isRefreshing: false,
 };
 
-// (STOCKS and INDICES already defined above)
-
-
-// ===== Sina Finance loader =====
-// Loads all stocks + indices as a single script tag; Sina sets window.hq_str_* variables.
-function loadSinaData() {
-  const codes = [
-    ...INDICES.map(i => i.sina),
-    ...STOCKS.map(s => s.sina),
-  ].join(',');
-
-  return new Promise((resolve, reject) => {
-    const script = document.createElement('script');
-    const timer = setTimeout(() => { cleanup(); reject(new Error('timeout')); }, 12000);
-
-    function cleanup() { clearTimeout(timer); script.remove(); }
-
-    script.src = 'https://hq.sinajs.cn/list=' + codes + '&rn=' + Date.now();
-    script.onload  = () => { cleanup(); resolve(); };
-    script.onerror = () => { cleanup(); reject(new Error('sina load failed')); };
-    document.head.appendChild(script);
-  });
+// ===== Load data.json (same-origin, no CORS/Referer issues) =====
+async function loadMarketData() {
+  const resp = await fetch('./data.json?_=' + Date.now());
+  if (!resp.ok) throw new Error('HTTP ' + resp.status);
+  state.marketData = await resp.json();
 }
 
-// Parse one Sina US quote from window.hq_str_{sinaCode}
-// Format: "Name,price,change,changePct,prevClose,open,vol,mktcap,high,low,tz,time,date,?,ahTime,ahDate,ahPrice,ahChange,ahPct,date2"
-function parseSina(sinaCode) {
-  const raw = window['hq_str_' + sinaCode];
-  if (!raw || !raw.trim()) return null;
-  const p = raw.split(',');
-  const price = parseFloat(p[1]);
-  if (!price || isNaN(price)) return null;
-
-  const ahPrice = parseFloat(p[16]);
-  const ahPct   = parseFloat(p[18]);
-
-  return {
-    name:      p[0] || sinaCode,
-    price,
-    change:    parseFloat(p[2]) || 0,
-    changePct: parseFloat(p[3]) || 0,
-    high:      parseFloat(p[8]) || 0,
-    low:       parseFloat(p[9]) || 0,
-    ahPrice:   (ahPrice && ahPrice > 0 && ahPrice !== price) ? ahPrice : null,
-    ahPct:     (ahPrice && ahPrice > 0 && ahPrice !== price) ? (ahPct || 0) : null,
-  };
-}
-
-// ===== Tiantian Fund Estimate =====
-// The API always calls window.jsonpgz({...}). Use a serial queue to avoid collisions.
+// ===== Tiantian Fund (for user-added custom codes only) =====
 const _fundQueue = [];
 let _fundBusy = false;
 
@@ -619,41 +577,22 @@ function fetchFundEstimate(code) {
 }
 
 async function _drainFundQueue() {
-  if (_fundQueue.length === 0) { _fundBusy = false; return; }
+  if (!_fundQueue.length) { _fundBusy = false; return; }
   _fundBusy = true;
   const { code, resolve, reject } = _fundQueue.shift();
-  try {
-    const data = await _fetchOneFund(code);
-    resolve(data);
-  } catch (e) {
-    reject(e);
-  }
+  try { resolve(await _fetchOneFund(code)); }
+  catch (e) { reject(e); }
   _drainFundQueue();
 }
 
 function _fetchOneFund(code) {
   return new Promise((resolve, reject) => {
     const script = document.createElement('script');
-    const timer = setTimeout(() => {
-      window.jsonpgz = null;
-      cleanup();
-      reject(new Error('timeout'));
-    }, 10000);
-
+    const timer = setTimeout(() => { window.jsonpgz = null; cleanup(); reject(new Error('timeout')); }, 10000);
     function cleanup() { clearTimeout(timer); script.remove(); }
-
-    window.jsonpgz = (data) => {
-      window.jsonpgz = null;
-      cleanup();
-      resolve(data);
-    };
-
+    window.jsonpgz = (data) => { window.jsonpgz = null; cleanup(); resolve(data); };
     script.src = 'https://fundgz.1234567.com.cn/js/' + code + '.js?v=' + Date.now();
-    script.onerror = () => {
-      window.jsonpgz = null;
-      cleanup();
-      reject(new Error('load failed'));
-    };
+    script.onerror = () => { window.jsonpgz = null; cleanup(); reject(new Error('load failed')); };
     document.head.appendChild(script);
   });
 }
@@ -663,7 +602,6 @@ function fmtNum(n, d) {
   const v = parseFloat(n);
   return isNaN(v) ? '--' : v.toFixed(d !== undefined ? d : 2);
 }
-
 function fmtPct(p) {
   const v = parseFloat(p);
   if (isNaN(v)) return { text: '--', cls: 'flat' };
@@ -675,20 +613,15 @@ function fmtPct(p) {
 function getMarketStatus() {
   const now = new Date();
   const utcMs = now.getTime() + now.getTimezoneOffset() * 60000;
-  // Rough DST: EDT (UTC-4) Mar–Nov, EST (UTC-5) otherwise
   const month = now.getUTCMonth() + 1;
-  const offset = (month >= 3 && month <= 11) ? -4 : -5;
-  const et = new Date(utcMs + offset * 3600000);
-  const dow = et.getDay();
+  const et = new Date(utcMs + ((month >= 3 && month <= 11) ? -4 : -5) * 3600000);
   const t = et.getHours() * 60 + et.getMinutes();
-
-  if (dow === 0 || dow === 6) return { label: '周末休市', state: 'closed' };
-  if (t >= 570 && t < 960)    return { label: '美股交易中', state: 'open' };
-  if (t >= 960 && t < 1200)   return { label: '盘后交易',   state: 'afterhours' };
-  if (t >= 240 && t < 570)    return { label: '盘前交易',   state: 'afterhours' };
+  if (et.getDay() === 0 || et.getDay() === 6) return { label: '周末休市',   state: 'closed' };
+  if (t >= 570 && t < 960)                    return { label: '美股交易中', state: 'open' };
+  if (t >= 960 && t < 1200)                   return { label: '盘后交易',   state: 'afterhours' };
+  if (t >= 240 && t < 570)                    return { label: '盘前交易',   state: 'afterhours' };
   return { label: '已收盘', state: 'closed' };
 }
-
 function updateMarketStatus() {
   const ms = getMarketStatus();
   document.getElementById('statusDot').className = 'status-dot ' + ms.state;
@@ -696,14 +629,11 @@ function updateMarketStatus() {
 }
 
 // ===== Render Indices =====
-function renderIndices(loaded) {
-  const grid = document.getElementById('indicesGrid');
-  grid.innerHTML = INDICES.map(idx => {
-    const q = loaded ? parseSina(idx.sina) : null;
-    if (!q) {
-      return '<div class="index-card"><div class="index-name">' + idx.name +
-        '</div><div class="index-price flat">' + (loaded ? '获取失败' : '加载中...') + '</div></div>';
-    }
+function renderIndices() {
+  const d = state.marketData;
+  document.getElementById('indicesGrid').innerHTML = INDICES.map(idx => {
+    const q = d && d.indices && d.indices[idx.sina];
+    if (!q) return '<div class="index-card"><div class="index-name">' + idx.name + '</div><div class="index-price flat">--</div></div>';
     const pct  = fmtPct(q.changePct);
     const sign = q.change >= 0 ? '+' : '';
     return '<div class="index-card">' +
@@ -715,15 +645,11 @@ function renderIndices(loaded) {
 }
 
 // ===== Render Stocks =====
-function renderStocks(loaded) {
-  const grid = document.getElementById('stocksGrid');
-  grid.innerHTML = STOCKS.map(s => {
-    const q = loaded ? parseSina(s.sina) : null;
-    if (!q) {
-      return '<div class="stock-card"><div class="stock-ticker">' + s.ticker +
-        '</div><div class="stock-name">' + s.name +
-        '</div><div class="stock-price flat">' + (loaded ? '失败' : '...') + '</div></div>';
-    }
+function renderStocks() {
+  const d = state.marketData;
+  document.getElementById('stocksGrid').innerHTML = STOCKS.map(s => {
+    const q = d && d.stocks && d.stocks[s.sina];
+    if (!q) return '<div class="stock-card"><div class="stock-ticker">' + s.ticker + '</div><div class="stock-name">' + s.name + '</div><div class="stock-price flat">--</div></div>';
     const pct  = fmtPct(q.changePct);
     const sign = q.change >= 0 ? '+' : '';
     const ahPct = q.ahPrice ? fmtPct(q.ahPct) : null;
@@ -732,22 +658,20 @@ function renderStocks(loaded) {
       '<div class="stock-name">' + s.name + '</div>' +
       '<div class="stock-price ' + pct.cls + '">$' + fmtNum(q.price) + '</div>' +
       '<div class="stock-change ' + pct.cls + '">' + pct.text + ' (' + sign + fmtNum(q.change) + ')</div>' +
-      (q.ahPrice ? '<div class="stock-ah">盘后 $' + fmtNum(q.ahPrice) + ' ' + (ahPct ? ahPct.text : '') + '</div>' : '') +
+      (q.ahPrice ? '<div class="stock-ah">盘后 $' + fmtNum(q.ahPrice) + (ahPct ? ' ' + ahPct.text : '') + '</div>' : '') +
       '</div>';
   }).join('');
 }
 
-// ===== Fund CRUD =====
-function saveFunds() {
-  localStorage.setItem('tracked_funds', JSON.stringify(state.funds));
-}
+// ===== Fund Cards =====
+function saveFunds() { localStorage.setItem('tracked_funds', JSON.stringify(state.funds)); }
 
 function addPreset(code, name) {
   if (state.funds.find(f => f.code === code)) { showToast('已在列表中'); return; }
   state.funds.push({ code, name });
   saveFunds();
   renderFundCards();
-  fetchAndRenderFund(code);
+  loadFundData(code);
 }
 
 function addFund() {
@@ -759,7 +683,7 @@ function addFund() {
   saveFunds();
   input.value = '';
   renderFundCards();
-  fetchAndRenderFund(code);
+  loadFundData(code);
 }
 
 function removeFund(code) {
@@ -769,59 +693,54 @@ function removeFund(code) {
   renderFundCards();
 }
 
-async function fetchAndRenderFund(code) {
+async function loadFundData(code) {
+  // 1. Check data.json first (preset funds fetched server-side)
+  const serverFund = state.marketData && state.marketData.funds && state.marketData.funds[code];
+  if (serverFund) {
+    state.fundData[code] = serverFund;
+    const fund = state.funds.find(f => f.code === code);
+    if (fund && serverFund.name) { fund.name = serverFund.name; saveFunds(); }
+    renderFundCards();
+    return;
+  }
+  // 2. Fallback: try direct Tiantian API (for non-preset codes)
   try {
     const data = await fetchFundEstimate(code);
     state.fundData[code] = data;
-    // Update stored name from API response
     const fund = state.funds.find(f => f.code === code);
     if (fund && data.name) { fund.name = data.name; saveFunds(); }
   } catch (e) {
-    state.fundData[code] = { error: true, msg: e.message };
+    state.fundData[code] = { error: true };
   }
   renderFundCards();
 }
 
-// ===== Render Fund Cards =====
 function renderFundCards() {
   const container = document.getElementById('fundCards');
   const empty     = document.getElementById('emptyState');
-
-  if (state.funds.length === 0) {
-    container.innerHTML = '';
-    empty.style.display = 'block';
-    return;
-  }
+  if (!state.funds.length) { container.innerHTML = ''; empty.style.display = 'block'; return; }
   empty.style.display = 'none';
 
   container.innerHTML = state.funds.map(fund => {
     const data = state.fundData[fund.code];
     const name = (data && data.name) || fund.name || fund.code;
 
-    if (!data) {
-      return '<div class="fund-card loading">' +
-        '<div class="fund-card-left">' +
-        '<div class="fund-card-name">' + name + '</div>' +
-        '<div class="fund-card-code">' + fund.code + '</div></div>' +
-        '<div class="fund-card-right"><div class="est-nav flat"><span class="spinner"></span></div></div>' +
-        '<button class="remove-btn" onclick="removeFund(\'' + fund.code + '\')">×</button></div>';
-    }
+    if (!data) return '<div class="fund-card loading">' +
+      '<div class="fund-card-left"><div class="fund-card-name">' + name + '</div>' +
+      '<div class="fund-card-code">' + fund.code + '</div></div>' +
+      '<div class="fund-card-right"><div class="est-nav flat"><span class="spinner"></span></div></div>' +
+      '<button class="remove-btn" onclick="removeFund(\'' + fund.code + '\')">×</button></div>';
 
-    if (data.error) {
-      return '<div class="fund-card">' +
-        '<div class="fund-card-left">' +
-        '<div class="fund-card-name">' + name + '</div>' +
-        '<div class="fund-card-code">' + fund.code + '</div>' +
-        '<div style="font-size:12px;color:var(--down);margin-top:4px">获取失败：基金代码不存在或暂无估算数据</div>' +
-        '</div>' +
-        '<button class="remove-btn" onclick="removeFund(\'' + fund.code + '\')">×</button></div>';
-    }
+    if (data.error) return '<div class="fund-card">' +
+      '<div class="fund-card-left"><div class="fund-card-name">' + name + '</div>' +
+      '<div class="fund-card-code">' + fund.code + '</div>' +
+      '<div style="font-size:12px;color:var(--down);margin-top:4px">获取失败，请确认代码正确</div></div>' +
+      '<button class="remove-btn" onclick="removeFund(\'' + fund.code + '\')">×</button></div>';
 
     const gsz  = data.gsz  ? parseFloat(data.gsz).toFixed(4)  : '--';
     const pct  = fmtPct(data.gszzl);
     const dwjz = data.dwjz ? parseFloat(data.dwjz).toFixed(4) : '--';
-    const jzrq = data.jzrq || '--';
-    const time = (data.gztime || '--').slice(-8);
+    const time = (data.gztime || '').slice(-8) || '--';
 
     return '<div class="fund-card">' +
       '<div class="fund-card-left">' +
@@ -829,7 +748,7 @@ function renderFundCards() {
       '<div class="fund-card-code">' + fund.code + '</div>' +
       '<div class="fund-meta">' +
       '<span><span class="label">上日净值</span><span class="val">' + dwjz + '</span></span>' +
-      '<span><span class="label">净值日期</span><span class="val">' + jzrq + '</span></span>' +
+      '<span><span class="label">净值日期</span><span class="val">' + (data.jzrq||'--') + '</span></span>' +
       '<span><span class="label">估算时间</span><span class="val">' + time + '</span></span>' +
       '</div></div>' +
       '<div class="fund-card-right">' +
@@ -849,7 +768,7 @@ function showToast(msg) {
   setTimeout(() => t.classList.remove('show'), 2500);
 }
 
-// ===== Main Refresh =====
+// ===== Refresh =====
 async function refreshAll() {
   if (state.isRefreshing) return;
   state.isRefreshing = true;
@@ -859,40 +778,38 @@ async function refreshAll() {
   updateMarketStatus();
 
   try {
-    // Load Sina data for stocks + indices
-    await loadSinaData();
-    renderIndices(true);
-    renderStocks(true);
+    await loadMarketData();
+    renderIndices();
+    renderStocks();
+
+    const d = state.marketData;
+    if (d && d.updatedCN) {
+      document.getElementById('refreshInfo').textContent = '数据时间: ' + d.updatedCN + ' CST';
+    } else {
+      document.getElementById('refreshInfo').textContent = '等待首次数据更新...';
+    }
+
+    // Reload fund data from the fresh data.json
+    for (const fund of state.funds) {
+      await loadFundData(fund.code);
+    }
   } catch (e) {
-    console.warn('Sina data failed:', e);
-    renderIndices(true); // will show "获取失败"
-    renderStocks(true);
+    console.error('Refresh failed:', e);
+    document.getElementById('refreshInfo').textContent = '加载失败: ' + e.message;
   }
-
-  // Refresh all tracked funds (serial queue handles concurrency)
-  const fundRefreshes = state.funds.map(f => fetchAndRenderFund(f.code));
-  await Promise.allSettled(fundRefreshes);
-
-  state.lastUpdate = new Date();
-  document.getElementById('refreshInfo').textContent =
-    '更新: ' + state.lastUpdate.toLocaleTimeString('zh-CN', { hour12: false });
 
   state.isRefreshing = false;
   btn.disabled = false;
   btn.textContent = '刷新';
 }
 
-// ===== Auto Refresh =====
 function startAutoRefresh() {
   if (state.refreshTimer) clearInterval(state.refreshTimer);
   state.refreshTimer = setInterval(refreshAll, 60000);
 }
 
-// ===== Init =====
 async function init() {
   renderFundCards();
-  renderIndices(false);
-  renderStocks(false);
   await refreshAll();
   startAutoRefresh();
 }
